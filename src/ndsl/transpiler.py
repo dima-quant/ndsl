@@ -1,4 +1,60 @@
 """
+NDSL transpiler
+Copyright (c) 2026 Dmytro Makogon, see LICENSE (MIT).
+Transpiles subset of Python (NDSL) into Nim.
+The transpiler is based on the `ast` module adjusted to implement the following rules and features:
+
+rule:doublespace -> change four spaces to double spaces for indentation
+rule:dropwith -> drop "with" for "const", "let", "var", "export", "block"
+rule:writeexport -> write no parentheses for "export" by assigning low priority
+rule:dropbrackets -> remove brackets from what follows after "ptr" and "ref"
+rule:localname -> rename identifier that starts with _ to local_ otherwise add "*" when definition
+rule:classdef -> interpret class definition as type
+rule:classdefseq -> combine consecutive class definitions into one type def.
+Move method definitions outside type definitions
+rule:instantiation -> call with capitalized name and named arguments is interpreted as instantiation ("=" -> ":").
+Classes instantiated with keywords should be named starting with a capital letter
+rule:typealias -> type alias (also register as alias for dispatch): class Time(float64) -> type Time* = float64
+rule:typedistinct -> distinct type (decorated with "distinct"): class Time(float64) -> type Time* = distinct float64
+rule:funcdef -> adjust function definition according to Nim syntax as "proc" (or "func")
+rule:funcdefdecorated -> interpret decorators as definitions for "template", "iterator", "converter", "method".
+Other decorators are skipped
+rule:funcdefmut -> arguments denoted as "mut@" are mutable in function definition -> "var "
+rule:funcdefbody -> no body is written for function definition with "borrow" in pragma or only "pass"
+rule:funcdefinplace -> remove return ... from dunder defs for binary in-place operators __i...__, first argument is
+annotated as mutable if not done already
+rule:funcdefargswap -> arguments are swapped for binary operators "__radd__", "__rmul__", etc
+rule:funcdefrenamedunder -> rename binary operators __add__ -> "+", __sub__ -> "-", __getitem__ -> `[]`, etc
+rule:funcdefpackedtuple -> unpack tuples with "packed_tuple" in name
+rule:typedtemplate -> drop return from typed template or converter definition
+rule:pragma -> docstring with {.x.} is written as pragma {.x.}, if pragma contains "noSideEffect" func is defined
+rule:matchcase -> adjust match case according to Nim syntax, also for variant types
+rule:import -> write import from as import, drop from __future__ import ...
+rule:nodoubleimport -> do not write import module if already imported
+rule:varini -> var initialization call without arguments with the same name as annotation is interpreted as
+declaration ("with var: a: Rng = Rng()" transpiles as "var a: Rng")
+rule:assign -> operator <<= is defined as value assignment to a mutable variable , i.e. a <<= b transpile as a = b,
+for attributes and array elements not needed, can be just c.x = b or c[0] = b
+rule:comptime -> the expression "if comptime(x)" is written as "when x" ("if" directly followed by "comptime"
+should be resolvable at comptime (is interpreted as "when")
+rule:bitwiserename -> bitwise operations get precedence adjusted and are renamed << -> shl, >> -> shr, & -> and,
+| -> or, ^ -> xor
+rule:lowecasebool -> True -> true, False -> false, "None" -> "nil"
+rule:funcrename -> rename functions "print" to "echo", "str" to "$"
+rule:stringjoin -> replace "f" by "&"
+rule:enum -> "NIntEnum", "NStrEnum" rename to "Enum", drop "auto"
+rule:main -> replace __name__ == "__main__" by isMainModule
+rule:quote -> replace quotes to double quotes
+rule:deref -> pointer dereference: ".contents" -> "[]"
+rule:copy -> value types are copied, drop .copy()
+rule:inlineif -> write inline if according to Nim syntax
+rule:literaltypes -> write as type suffix uint(0x9e3779b97f4a7c15) -> 0x9e3779b97f4a7c15'u64
+rule:isnot -> write isnot according to Nim syntax
+rule:notin -> write notin according to Nim syntax
+feature:subscriptrename -> subscript can be renames if in keywords_no_with context ("const", "let", "var", "export")
+
+The docstring for the original `ast` module is given below:
+
     ast
     ~~~
 
@@ -717,7 +773,7 @@ class _Precedence:
             return self
 
 
-_SINGLE_QUOTES = ("'", '"')
+_SINGLE_QUOTES = ('"', "'")  # rule:quote
 _MULTI_QUOTES = ('"""', "'''")
 _ALL_QUOTES = (*_SINGLE_QUOTES, *_MULTI_QUOTES)
 
@@ -733,6 +789,24 @@ class _Unparser(NodeVisitor):
         self._indent = 0
         self._avoid_backslashes = _avoid_backslashes
         self._in_try_star = False
+        self.alias = {"object": "Object"}
+        self.renamed_keywords = {}
+        self.module_names = []
+        self._module_rename = {"ndsl.ntypes": "ndsl/pydefs", "math": "ndsl/pystd/math"}
+        self._no_bracket_subscript = ["ptr", "ref"]  # rule:dropbrackets
+        self._keywords_no_with = ["const", "let", "var", "export"]  # rule:dropwith
+        self._keywords_rename = {}
+        self._keywords_no_with_colon = ["block"]  # rule:dropwith
+        self._context_stack = []
+        self._attribute_replace = {"copy": "", "contents": "[]"}
+        self._set_low_precedence = ["export"]
+        self._class_def_methods = []
+        self._type_suffixes = ["i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "f32", "f64"] #, "u", "f", "d"]
+        self._func_rename = {"print": "echo", "str": "$"}
+        self._subscript_rename = {} # if var or let context
+        self._const_rename = {"True": "true", "False": "false", "None": "nil"}  # rule:lowecasebool
+        self._enums = ["NIntEnum", "NStrEnum"]
+        self._def_decorators = ["template", "iterator", "converter", "method"]
 
     def interleave(self, inter, f, seq):
         """Call f on each item in seq, calling inter() in between."""
@@ -765,7 +839,8 @@ class _Unparser(NodeVisitor):
         """Indent a piece of text and append it, according to the current
         indentation level"""
         self.maybe_newline()
-        self.write("    " * self._indent + text)
+        # rule:doublespace
+        self.write("  " * self._indent + text)
 
     def write(self, *text):
         """Add new source parts"""
@@ -782,13 +857,13 @@ class _Unparser(NodeVisitor):
         self._source = original_source
 
     @contextmanager
-    def block(self, *, extra = None):
+    def block(self, *, extra = None, start = ":"):
         """A context manager for preparing the source for blocks. It adds
         the character':', increases the indentation on enter and decreases
         the indentation on exit. If *extra* is given, it will be directly
         appended after the colon character.
         """
-        self.write(":")
+        self.write(start)  # rule:dropwith
         if extra:
             self.write(extra)
         self._indent += 1
@@ -843,9 +918,31 @@ class _Unparser(NodeVisitor):
             return f" # type: {comment}"
 
     def traverse(self, node):
+        # rule:classdefseq
+        _prev_class_def = False
         if isinstance(node, list):
             for item in node:
+                class_def = isinstance(item, ClassDef)
+                if class_def and not _prev_class_def:
+                    # start type def
+                    self.fill("type")
+                    self._indent += 1
+                if not class_def and _prev_class_def:
+                    # end type def
+                    self._indent -= 1
+                    if len(self._class_def_methods) > 0:
+                        self.traverse(self._class_def_methods)
+                        # assume for now no nested class defs
+                        self._class_def_methods = []
                 self.traverse(item)
+                _prev_class_def = class_def
+            if len(node) > 0 and _prev_class_def: # if the last item was a class def
+                # end type def
+                self._indent -= 1
+                if len(self._class_def_methods) > 0:
+                    self.traverse(self._class_def_methods)
+                    # assume for now no nested class defs
+                    self._class_def_methods = []
         else:
             super().visit(node)
 
@@ -885,7 +982,11 @@ class _Unparser(NodeVisitor):
 
     def visit_Expr(self, node):
         self.fill()
-        self.set_precedence(_Precedence.YIELD, node.value)
+        # rule:writeexport
+        if self._context_stack and self._context_stack[-1] in self._set_low_precedence:
+            self.set_precedence(_Precedence.NAMED_EXPR, node.value)
+        else:
+            self.set_precedence(_Precedence.YIELD, node.value)
         self.traverse(node.value)
 
     def visit_NamedExpr(self, node):
@@ -896,16 +997,30 @@ class _Unparser(NodeVisitor):
             self.traverse(node.value)
 
     def visit_Import(self, node):
-        self.fill("import ")
-        self.interleave(lambda: self.write(", "), self.traverse, node.names)
+        # rule:nodoubleimport
+        refined_list = [n for n in node.names if n.name not in self.module_names]
+        if refined_list:
+            self.fill("import ")
+            self.interleave(lambda: self.write(", "), self.traverse, refined_list)
+            self.module_names += [n.name for n in refined_list]
 
     def visit_ImportFrom(self, node):
-        self.fill("from ")
-        self.write("." * (node.level or 0))
-        if node.module:
-            self.write(node.module)
-        self.write(" import ")
-        self.interleave(lambda: self.write(", "), self.traverse, node.names)
+        # rule:import
+        # self.fill("from ")
+        # self.write("." * (node.level or 0))
+        if node.module and not node.module in ["__future__"]:
+            self.fill("import ")
+            module_name = node.module
+            module_name_split = module_name.split(".")
+            if module_name in self._module_rename:
+                self.write(self._module_rename[module_name])
+            elif module_name_split[0] == "ndsl":
+                self.write("/".join(module_name_split[1:]))
+            else:
+                self.module_names.append(module_name)
+                self.write(node.module)
+        # self.write("import ")
+        # self.interleave(lambda: self.write(", "), self.traverse, node.names)
 
     def visit_Assign(self, node):
         self.fill()
@@ -920,16 +1035,26 @@ class _Unparser(NodeVisitor):
     def visit_AugAssign(self, node):
         self.fill()
         self.traverse(node.target)
-        self.write(" " + self.binop[node.op.__class__.__name__] + "= ")
+        self.write(" " + self.ibinop[node.op.__class__.__name__] + "= ")  # rule:assign
         self.traverse(node.value)
 
     def visit_AnnAssign(self, node):
         self.fill()
+        set_annotation = isinstance(node.annotation, Set)
+        if node.simple and isinstance(node.target, Name) and not set_annotation:
+            # rule:localname
+            node.target.id = self._adjust_name(node.target.id)
         with self.delimit_if("(", ")", not node.simple and isinstance(node.target, Name)):
             self.traverse(node.target)
         self.write(": ")
         self.traverse(node.annotation)
-        if node.value:
+        var_declaration = False # rule:varini
+        if "var" in self._context_stack:
+            # check this is a default class init that should be declared
+            # if value is a empty call with the same name as annotation then this is a declaration
+            if isinstance(node.value, Call) and len(node.value.args) == 0:
+                var_declaration = isinstance(node.value.func, Name) and node.value.func.id == node.annotation.id
+        if node.value and not var_declaration:
             self.write(" = ")
             self.traverse(node.value)
 
@@ -1045,54 +1170,208 @@ class _Unparser(NodeVisitor):
         with self.block():
             self.traverse(node.body)
 
+    def _adjust_name(self, name, definition=True):
+        # rule:localname
+        if len(name)>1 and name[0] == "_":
+            _str = "local" + name
+        elif definition and not name[0].startswith("local_"):
+            _str = name + "*"
+        else:
+            _str = name
+        return _str
+
     def visit_ClassDef(self, node):
-        self.maybe_newline()
-        for deco in node.decorator_list:
-            self.fill("@")
-            self.traverse(deco)
-        self.fill("class " + node.name)
+        # rule:classdef
+        if node.decorator_list:
+            deco = node.decorator_list[0].id
+        else:
+            deco = ""
+        # for deco in node.decorator_list:
+        #     self.fill("@")
+        #     self.traverse(deco)
+        # rule:pragma
+        body, pragma = self._get_body_and_pragma(node)
+        type_str = self._adjust_name(node.name) # rule:localname
+        _pass = isinstance(body[0], Pass)
+        no_attr = _pass # no attributes, i.e. pass or only methods
+        # deco in ["ref", "ptr", "distinct"]
+        no_object = no_attr or deco
+        enum = False # rule:enum
+        if node.bases[0].id[0] == "_":
+            base = node.bases[0].id[1:]
+        else:
+            base = node.bases[0].id
+        if base == self.alias["object"]:
+            from_object = "object"
+        elif base in self._enums:
+            from_object = "enum "
+            enum = True
+        elif no_object:
+            # rule:typealias or rule:typedistinct
+            from_object = base
+        else:
+            from_object = "object of " + base
+        self.fill(type_str)
+        if pragma:
+            self.write(" {." + pragma + ".}")
+        self.write(" =")
+        if deco:
+            self.write(" " + deco)
+        self.write(" " + from_object)
         if hasattr(node, "type_params"):
             self._type_params_helper(node.type_params)
-        with self.delimit_if("(", ")", condition = node.bases or node.keywords):
-            comma = False
-            for e in node.bases:
-                if comma:
-                    self.write(", ")
-                else:
-                    comma = True
-                self.traverse(e)
-            for e in node.keywords:
-                if comma:
-                    self.write(", ")
-                else:
-                    comma = True
-                self.traverse(e)
-
-        with self.block():
-            self._write_docstring_and_traverse_body(node)
+        # with self.delimit_if("(", ")", condition = node.bases or node.keywords):
+        #     comma = False
+        #     for e in node.bases:
+        #         if comma:
+        #             self.write(", ")
+        #         else:
+        #             comma = True
+        #         self.traverse(e)
+        #     for e in node.keywords:
+        #         if comma:
+        #             self.write(", ")
+        #         else:
+        #             comma = True
+        #         self.traverse(e)
+        if not _pass:
+            with self.block(start=""):
+                # rule:classdefseq, split body into attributes and methods
+                body_rest = []
+                if not isinstance(body, list):
+                    body = [body]
+                for b in body:
+                    if isinstance(b, FunctionDef) or isinstance(b, AsyncFunctionDef):
+                        self._class_def_methods.append(b)
+                    else:
+                        if enum and isinstance(b, Assign) and isinstance(b.value, Call) and \
+                            isinstance(b.value.func, Name) and b.value.func.id == "auto":
+                            body_rest.append(b.targets[0])
+                        else:
+                            body_rest.append(b)
+                if body_rest:
+                    # rule:matchcase, check for variant types
+                    if (len(body_rest) > 1) and isinstance(body_rest[0], AnnAssign) and isinstance(body_rest[1], Match):
+                        discriminator_name = self._adjust_name(body_rest[0].target.id) # rule:localname
+                        discriminator_type = body_rest[0].annotation.id
+                        self.fill(f"case {discriminator_name}: {discriminator_type}")
+                        with self.block(start=""):
+                            for case in body_rest[1].cases:
+                                self.traverse(case)
+                        if (len(body_rest) > 2):
+                            self.traverse(body_rest[2:])
+                    else:
+                        if enum:
+                            self.fill("")
+                            self.interleave(lambda: self.write(", "), self.traverse, body_rest)
+                        else:
+                            self.traverse(body_rest)
+        self.maybe_newline()
 
     def visit_FunctionDef(self, node):
-        self._function_helper(node, "def")
+        self._function_helper(node, "")
 
     def visit_AsyncFunctionDef(self, node):
-        self._function_helper(node, "async def")
+        self._function_helper(node, "async ")
+
+    def _check_packed_tuple(self, node_arg_args, body):
+        # rule:funcdefpackedtuple
+        for i, arg in enumerate(node_arg_args):
+            if isinstance(arg.annotation, Subscript) and isinstance(arg.annotation.slice, Tuple) and\
+                arg.arg.startswith("packed_tuple"):
+                ast_name = arg.annotation.value
+                if isinstance(ast_name, Name) and ast_name.id == "tuple":
+                    tuple_name = arg.arg
+                    types = arg.annotation.slice.elts
+                    drop_j = -1
+                    for j, item in enumerate(body):
+                        if isinstance(item, Assign) and isinstance(item.value, Name) and item.value.id == tuple_name:
+                            if isinstance(item.targets[0], Tuple):
+                                defs = [elt.id + ": " + tp.id for elt, tp in zip(item.targets[0].elts, types)]
+                                ast_name.id = ", ".join(defs)
+                                node_arg_args[i] = ast_name
+                                drop_j = j
+                    if drop_j > -1:
+                        body.pop(drop_j)
 
     def _function_helper(self, node, fill_suffix):
+        # rule:funcdef
         self.maybe_newline()
+        decl_str = "proc"
+        # rule:funcdefdecorated
         for deco in node.decorator_list:
-            self.fill("@")
-            self.traverse(deco)
-        def_str = fill_suffix + " " + node.name
+            if isinstance(deco, Name) and deco.id in self._def_decorators:
+                decl_str = deco.id
+        # rule:pragma
+        body, pragma = self._get_body_and_pragma(node)
+        # rule:funcdefbody
+        write_body = not isinstance(body[0], Pass)
+        if pragma:
+            parsed_pragma = pragma.replace(" ", "").split(",")
+            write_body = write_body and "borrow" not in parsed_pragma
+            if "noSideEffect" in parsed_pragma and decl_str == "proc":
+                decl_str = "func"
+                pragma = ",".join([x for x in parsed_pragma if x != "noSideEffect"])
+        func_name = node.name
+        do_arg_swap = False # rule:funcdefargswap
+        inplace = False # rule:funcdefinplace
+        no_return = False # rule:typedtemplate
+        if func_name[0:2] == "__" and func_name in self.dunder_ops:
+            do_arg_swap = func_name in self.binpops_with_arg_swap
+            inplace = func_name[2] == "i"
+            func_name = self.dunder_ops[func_name] # rule:funcdefrenamedunder
+        name_str = self._adjust_name(func_name) # rule:localname
+        def_str = fill_suffix + decl_str + " " + name_str
+        if inplace and isinstance(node.args.args[0].annotation, Name):
+            node.args.args[0].annotation.id = "var " + node.args.args[0].annotation.id
+        if do_arg_swap:
+            node.args.args[0], node.args.args[1] = node.args.args[1], node.args.args[0]
+        self._check_packed_tuple(node.args.args, body) # rule:funcdefpackedtuple
         self.fill(def_str)
         if hasattr(node, "type_params"):
             self._type_params_helper(node.type_params)
         with self.delimit("(", ")"):
             self.traverse(node.args)
-        if node.returns:
-            self.write(" -> ")
+        if node.returns and not isinstance(node.returns, Constant) and not inplace:
+            self.write(": ")
             self.traverse(node.returns)
-        with self.block(extra=self.get_type_comment(node)):
-            self._write_docstring_and_traverse_body(node)
+            typed_template = decl_str == "template" and isinstance(node.returns, Name) \
+                and not node.returns.id == "untyped"
+            no_return = typed_template or decl_str == "converter"
+        if pragma:
+            self.write(" {." + pragma + ".}")
+        if write_body:
+            with self.block(extra=self.get_type_comment(node), start=" ="):
+                if isinstance(body, list) and isinstance(body[-1], Return):
+                    if body[:-1]:
+                        self.traverse(body[:-1])
+                    if no_return:
+                        if body[-1].value:
+                            # do not print "return"
+                            self.fill("")
+                            self.traverse(body[-1].value)
+                    elif not inplace:
+                        self.traverse(body[-1])
+                else:
+                    self.traverse(body)
+
+    def _get_pragma(self, docstring):
+        doc = docstring.value
+        if "{." in doc:
+            pragma = doc.split("{.")[1].split(".}")[0]
+        else:
+            pragma = ""
+        return pragma
+
+    def _get_body_and_pragma(self, node):
+        if (docstring := self.get_raw_docstring(node)):
+            # check if pragma {. .} is present
+            pragma = self._get_pragma(docstring)
+            body = node.body[1:]
+        else:
+            pragma = ""
+            body = node.body
+        return body, pragma
 
     def _type_params_helper(self, type_params):
         if type_params is not None and len(type_params) > 0:
@@ -1138,8 +1417,14 @@ class _Unparser(NodeVisitor):
                 self.traverse(node.orelse)
 
     def visit_If(self, node):
-        self.fill("if ")
-        self.traverse(node.test)
+        # rule:comptime
+        comptime = isinstance(node.test, Call) and isinstance(node.test.func, Name) and node.test.func.id == "comptime"
+        if comptime:
+            self.fill("when ")
+            self.traverse(node.test.args[0])
+        else:
+            self.fill("if ")
+            self.traverse(node.test)
         with self.block():
             self.traverse(node.body)
         # collapse nested ifs into equivalent elifs.
@@ -1166,10 +1451,29 @@ class _Unparser(NodeVisitor):
                 self.traverse(node.orelse)
 
     def visit_With(self, node):
-        self.fill("with ")
+        # rule:dropwith
+        if isinstance(node.items[0].context_expr, Name):
+            name = node.items[0].context_expr.id
+            if name in self._keywords_no_with:
+                self.fill()
+                self._context_stack.append(name)
+                cont_pop = True
+                start = ""
+            elif name in self._keywords_no_with_colon:
+                self.fill()
+                self._context_stack.append(name)
+                cont_pop = True
+                start = ":"
+            if name in self._keywords_rename:
+                node.items[0].context_expr.id = self._keywords_rename[name]
+        else:
+            self.fill("with ")
+            cont_pop = False
         self.interleave(lambda: self.write(", "), self.traverse, node.items)
-        with self.block(extra=self.get_type_comment(node)):
+        with self.block(extra=self.get_type_comment(node), start=start):
             self.traverse(node.body)
+        if cont_pop:
+            self._context_stack.pop()
 
     def visit_AsyncWith(self, node):
         self.fill("async with ")
@@ -1222,7 +1526,7 @@ class _Unparser(NodeVisitor):
         self.write(f"{quote_type}{string}{quote_type}")
 
     def visit_JoinedStr(self, node):
-        self.write("f")
+        self.write("&")  # rule:stringjoin
 
         fstring_parts = []
         for value in node.values:
@@ -1246,14 +1550,9 @@ class _Unparser(NodeVisitor):
                     fallback_to_repr = True
                     break
                 quote_types = new_quote_types
-            else:
-                if "\n" in value:
-                    quote_types = [q for q in quote_types if q in _MULTI_QUOTES]
-                    assert quote_types
-
-                new_quote_types = [q for q in quote_types if q not in value]
-                if new_quote_types:
-                    quote_types = new_quote_types
+            elif "\n" in value:  # rule:quote
+                quote_types = [q for q in quote_types if q in _MULTI_QUOTES]
+                assert quote_types
             new_fstring_parts.append(value)
 
         if fallback_to_repr:
@@ -1311,7 +1610,8 @@ class _Unparser(NodeVisitor):
                 self._write_fstring_inner(node.format_spec, is_format_spec=True)
 
     def visit_Name(self, node):
-        self.write(node.id)
+        name = self._adjust_name(node.id, definition=False) # rule:localname
+        self.write(name)
 
     def _write_docstring(self, node):
         self.fill()
@@ -1331,7 +1631,19 @@ class _Unparser(NodeVisitor):
         elif self._avoid_backslashes and isinstance(value, str):
             self._write_str_avoiding_backslashes(value)
         else:
-            self.write(repr(value))
+            # rule:quote
+            if isinstance(value, str):
+                value = repr("'" + value)  # force repr to use double quotes
+                expected_prefix = '"\''
+                assert value.startswith(expected_prefix), repr(value)
+                repr_value  = value[0] + value[len(expected_prefix):]
+            else:
+                repr_value = repr(value)
+            if repr_value in self._const_rename:
+                # rule:lowecasebool
+                self.write(self._const_rename[repr_value])
+            else:
+                self.write(repr_value)
 
     def visit_Constant(self, node):
         value = node.value
@@ -1392,10 +1704,12 @@ class _Unparser(NodeVisitor):
     def visit_IfExp(self, node):
         with self.require_parens(_Precedence.TEST, node):
             self.set_precedence(_Precedence.TEST.next(), node.body, node.test)
-            self.traverse(node.body)
-            self.write(" if ")
+            # rule:inlineif
+            self.write("if ")
             self.traverse(node.test)
-            self.write(" else ")
+            self.write(": ")
+            self.traverse(node.body)
+            self.write(" else: ")
             self.set_precedence(_Precedence.TEST, node.orelse)
             self.traverse(node.orelse)
 
@@ -1457,15 +1771,15 @@ class _Unparser(NodeVisitor):
                 self.write(" ")
             self.set_precedence(operator_precedence, node.operand)
             self.traverse(node.operand)
-
-    binop = {
+    # rule:assign
+    ibinop = {
         "Add": "+",
         "Sub": "-",
         "Mult": "*",
         "MatMult": "@",
         "Div": "/",
         "Mod": "%",
-        "LShift": "<<",
+        "LShift": "", # "<<",
         "RShift": ">>",
         "BitOr": "|",
         "BitXor": "^",
@@ -1473,21 +1787,79 @@ class _Unparser(NodeVisitor):
         "FloorDiv": "//",
         "Pow": "**",
     }
-
+    # rule:bitwiserename
+    binop = {
+        "Add": "+",
+        "Sub": "-",
+        "Mult": "*",
+        "MatMult": "@",
+        "Div": "/",
+        "Mod": "mod",
+        "LShift": "shl",
+        "RShift": "shr",
+        "BitOr": "or",
+        "BitXor": "xor",
+        "BitAnd": "and",
+        "FloorDiv": "div",
+        "Pow": "^",
+    }
+    # rule:funcdefargswap
+    binpops_with_arg_swap = ["__radd__", "__rmul__", "__rmatmul__", "__rdiv__", "__rfloordiv__"]
+    # rule:funcdefrenamedunder
+    dunder_ops = {
+        # unops
+        "__str__": "`$`",
+        "__getitem__": "`[]`",
+        # "__invert__": "`~`",
+        "__not__": "`not`",
+        "__pos__": "`+`",
+        "__neg__": "`-`",
+        # binops
+        "__eq__": "`==`",
+        "__add__": "`+`",
+        "__radd__": "`+`",
+        "__sub__": "`-`",
+        "__mul__": "`*`",
+        "__rmul__": "`*`",
+        "__matmul__": "`@`",
+        "__truediv__": "`/`",
+        "__floordiv__": "`div`",
+        "__mod__": "`mod`",
+        "__pow__": "`^`",
+        "__lshift__": "`shl`",
+        "__rshift__": "`shr`",
+        "__and__": "`and`",
+        "__xor__": "`xor`",
+        "__or__": "`|`",
+        "__iadd__": "`+=`",
+        "__isub__": "`-=`",
+        "__imul__": "`*=`",
+        "__imatmul__": "`@=`",
+        "__itruediv__": "`/=`",
+        "__ifloordiv__": "`//=`",
+        "__imod__": "`%=`",
+        "__ipow__": "`**=`",
+        "__ilshift__": "`<<=`",
+        "__irshift__": "`>>=`",
+        "__iand__": "`&=`",
+        "__ixor__": "`^=`",
+        "__ior__": "`|=`",
+    }
+# rule:bitwiserename
     binop_precedence = {
         "+": _Precedence.ARITH,
         "-": _Precedence.ARITH,
         "*": _Precedence.TERM,
         "@": _Precedence.TERM,
         "/": _Precedence.TERM,
-        "%": _Precedence.TERM,
-        "<<": _Precedence.SHIFT,
-        ">>": _Precedence.SHIFT,
-        "|": _Precedence.BOR,
-        "^": _Precedence.BXOR,
-        "&": _Precedence.BAND,
-        "//": _Precedence.TERM,
-        "**": _Precedence.POWER,
+        "mod": _Precedence.TERM,
+        "shl": _Precedence.TERM, #_Precedence.SHIFT,
+        "shr": _Precedence.TERM, #_Precedence.SHIFT,
+        "or": _Precedence.BOR,
+        "xor": _Precedence.BXOR,
+        "and": _Precedence.BAND,
+        "div": _Precedence.TERM,
+        "^": _Precedence.POWER,
     }
 
     binop_rassoc = frozenset(("**",))
@@ -1516,18 +1888,23 @@ class _Unparser(NodeVisitor):
         "Gt": ">",
         "GtE": ">=",
         "Is": "is",
-        "IsNot": "is not",
+        "IsNot": "isnot",  # rule:isnot
         "In": "in",
-        "NotIn": "not in",
+        "NotIn": "notin",  # rule:notin
     }
 
     def visit_Compare(self, node):
         with self.require_parens(_Precedence.CMP, node):
             self.set_precedence(_Precedence.CMP.next(), node.left, *node.comparators)
-            self.traverse(node.left)
-            for o, e in zip(node.ops, node.comparators):
-                self.write(" " + self.cmpops[o.__class__.__name__] + " ")
-                self.traverse(e)
+            # rule:main, check for "__name__ == __main__"
+            if isinstance(node.left, Name) and node.left.id == "__name__" and isinstance(node.ops[0], Eq) and \
+                isinstance(node.comparators[0], Constant) and node.comparators[0].value == "__main__":
+                self.write("isMainModule")
+            else:
+                self.traverse(node.left)
+                for o, e in zip(node.ops, node.comparators):
+                    self.write(" " + self.cmpops[o.__class__.__name__] + " ")
+                    self.traverse(e)
 
     boolops = {"And": "and", "Or": "or"}
     boolop_precedence = {"and": _Precedence.AND, "or": _Precedence.OR}
@@ -1554,26 +1931,55 @@ class _Unparser(NodeVisitor):
         # it or add an extra space to get 3 .__abs__().
         if isinstance(node.value, Constant) and isinstance(node.value.value, int):
             self.write(" ")
-        self.write(".")
-        self.write(node.attr)
+        if node.attr in self._attribute_replace:
+            # rule:deref and rule:copy
+            self.write(self._attribute_replace[node.attr])
+        else:
+            self.write(".")
+            attr = self._adjust_name(node.attr, definition=False) # rule:localname
+            self.write(attr)
 
     def visit_Call(self, node):
         self.set_precedence(_Precedence.ATOM, node.func)
-        self.traverse(node.func)
-        with self.delimit("(", ")"):
-            comma = False
-            for e in node.args:
-                if comma:
-                    self.write(", ")
+        if isinstance(node.func, Name) and node.func.id in self._type_suffixes:
+            # rule:literaltypes
+            self.traverse(node.args[0]) # should be only one argument
+            self.write("'")
+            self.traverse(node.func)
+        elif isinstance(node.func, Attribute) and node.func.attr in self._attribute_replace and not node.args:
+            # rule:deref and rule:copy
+            self.traverse(node.func.value)
+            self.write(self._attribute_replace[node.func.attr])
+        else:
+            pop = False
+            if isinstance(node.func, Name):
+                _name = node.func.id
+                if _name[0].isupper() or _name.startswith("local_") and _name[6].isupper():
+                    # rule:instantiation, classes instantiated with keywords should be named starting with a capital letter
+                    self._context_stack.append("instance")
                 else:
-                    comma = True
-                self.traverse(e)
-            for e in node.keywords:
-                if comma:
-                    self.write(", ")
-                else:
-                    comma = True
-                self.traverse(e)
+                    self._context_stack.append("call")
+                pop = True
+                # rule:funcrename
+                if _name in self._func_rename:
+                    node.func.id = self._func_rename[_name]
+            self.traverse(node.func)
+            with self.delimit("(", ")"):
+                comma = False
+                for e in node.args:
+                    if comma:
+                        self.write(", ")
+                    else:
+                        comma = True
+                    self.traverse(e)
+                for e in node.keywords:
+                    if comma:
+                        self.write(", ")
+                    else:
+                        comma = True
+                    self.traverse(e)
+            if pop:
+                self._context_stack.pop()
 
     def visit_Subscript(self, node):
         def is_non_empty_tuple(slice_value):
@@ -1583,13 +1989,22 @@ class _Unparser(NodeVisitor):
             )
 
         self.set_precedence(_Precedence.ATOM, node.value)
+        # feature:subscriptrename
+        if isinstance(node.value, Name) and node.value.id in self._subscript_rename and self._context_stack:
+            if self._context_stack[-1] in self._keywords_no_with:
+                node.value.id = self._subscript_rename[node.value.id]
         self.traverse(node.value)
-        with self.delimit("[", "]"):
-            if is_non_empty_tuple(node.slice):
-                # parentheses can be omitted if the tuple isn't empty
-                self.items_view(self.traverse, node.slice.elts)
-            else:
-                self.traverse(node.slice)
+        # rule:dropbrackets, ptr[] -> ptr
+        if isinstance(node.value, Name) and node.value.id in self._no_bracket_subscript:
+            self.write(" ")
+            self.traverse(node.slice)
+        else:
+            with self.delimit("[", "]"):
+                if is_non_empty_tuple(node.slice):
+                    # parentheses can be omitted if the tuple isn't empty
+                    self.items_view(self.traverse, node.slice.elts)
+                else:
+                    self.traverse(node.slice)
 
     def visit_Starred(self, node):
         self.write("*")
@@ -1610,17 +2025,26 @@ class _Unparser(NodeVisitor):
             self.traverse(node.step)
 
     def visit_Match(self, node):
-        self.fill("match ")
+        # rule:matchcase
+        self.fill("case ")
         self.traverse(node.subject)
         with self.block():
             for case in node.cases:
                 self.traverse(case)
 
     def visit_arg(self, node):
-        self.write(node.arg)
+        _name = self._adjust_name(node.arg, definition=False) # rule:localname
+        self.write(_name)
         if node.annotation:
             self.write(": ")
-            self.traverse(node.annotation)
+            ann = node.annotation
+            # rule:funcdefmut, check if annotated as mutable "mut @"
+            if isinstance(ann, BinOp) and isinstance(ann.op, MatMult) and \
+                isinstance(ann.left, Name) and ann.left.id == "mut":
+                self.write("var ")
+                self.traverse(ann.right)
+            else:
+                self.traverse(node.annotation)
 
     def visit_arguments(self, node):
         first = True
@@ -1678,7 +2102,11 @@ class _Unparser(NodeVisitor):
             self.write("**")
         else:
             self.write(node.arg)
-            self.write("=")
+            # rule:instantiation
+            if self._context_stack and self._context_stack[-1] == "instance":
+                self.write(":")
+            else:
+                self.write("=")
         self.traverse(node.value)
 
     def visit_Lambda(self, node):
@@ -1704,7 +2132,8 @@ class _Unparser(NodeVisitor):
             self.traverse(node.optional_vars)
 
     def visit_match_case(self, node):
-        self.fill("case ")
+        # rule:matchcase
+        self.fill("of ")
         self.traverse(node.pattern)
         if node.guard:
             self.write(" if ")
@@ -1793,7 +2222,7 @@ class _Unparser(NodeVisitor):
 
 def unparse(ast_obj):
     unparser = _Unparser()
-    return unparser.visit(ast_obj)
+    return unparser.visit(ast_obj), unparser.module_names
 
 
 _deprecated_globals = {
