@@ -1,7 +1,7 @@
 """
-NDSL transpiler
+nimic transpiler
 Copyright (c) 2026 Dmytro Makogon, see LICENSE (MIT).
-Transpiles subset of Python (NDSL) into Nim.
+Transpiles subset of Python (nimic) into Nim.
 The transpiler is based on the `ast` module adjusted to implement the following rules and features:
 
 rule:doublespace -> change four spaces to double spaces for indentation
@@ -792,7 +792,7 @@ class _Unparser(NodeVisitor):
         self.alias = {"object": "Object"}
         self.renamed_keywords = {}
         self.module_names = []
-        self._module_rename = {"ndsl.ntypes": "ndsl/pydefs", "math": "ndsl/pystd/math"}
+        self._module_rename = {"nimic.ntypes": "nimic/pydefs", "math": "nimic/pystd/math"}
         self._no_bracket_subscript = ["ptr", "ref"]  # rule:dropbrackets
         self._keywords_no_with = ["const", "let", "var", "export"]  # rule:dropwith
         self._keywords_rename = {}
@@ -1014,7 +1014,7 @@ class _Unparser(NodeVisitor):
             module_name_split = module_name.split(".")
             if module_name in self._module_rename:
                 self.write(self._module_rename[module_name])
-            elif module_name_split[0] == "ndsl":
+            elif module_name_split[0] == "nimic":
                 self.write("/".join(module_name_split[1:]))
             else:
                 self.module_names.append(module_name)

@@ -1,5 +1,5 @@
 [project]
-name = "ndsl"
+name = "nimic"
 version = "0.0.1"
 authors = [{ name = "Dmytro Makogon"}]
 description = "Pure Python module that facilitates writing AOT compilable code"
@@ -10,15 +10,14 @@ dependencies = []
 classifiers = [
     "Topic :: Software Development :: Compilers",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Nim",
 ]
 
 [project.scripts]
-ndsl = "ndsl:main"
+nimic = "nimic:main"
 
 [build-system]
 requires = ["uv_build>=0.9.21,<0.10.0"]
 build-backend = "uv_build"
 
 [project.urls] # Optional
-"Source" = "https://github.com/dima-quant/ndsl.git"
+"Source" = "https://github.com/dima-quant/nimic.git"
